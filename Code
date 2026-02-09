@@ -1,0 +1,490 @@
+import os  # Import the OS module to handle file paths, directories, and system commands
+import random  # Import Python's random module for reproducible random operations
+import numpy as np  # Import NumPy for numerical arrays and vectorized operations
+import pandas as pd  # Import pandas for reading and manipulating CSV annotation files
+import tensorflow as tf  # Import TensorFlow for building training pipelines and neural networks
+import cv2  # Import OpenCV for video reading and frame extraction
+import matplotlib.pyplot as plt  # Import Matplotlib for plotting training curves and results
+import glob  # Import glob to find files using wildcard patterns (e.g., *.mp4)
+import pickle  # Import pickle for optional MEDIAPIPE pkl handling (not used in this RGB SSL pipeline)
+from tensorflow import keras  # Import Keras API from TensorFlow for model definition and training
+from tensorflow.keras import layers  # Import Keras layers for building the neural network
+
+# Set random seeds for fully reproducible results across all libraries
+SEED = 42  # Define a fixed seed constant so random operations repeat deterministically
+random.seed(SEED)  # Seed Python's random generator
+np.random.seed(SEED)  # Seed NumPy's random generator
+tf.random.set_seed(SEED)  # Seed TensorFlow's random generator
+
+print("SignaMed SWL-LSE Dataset - ROBUST Complete Pipeline (Binary Temporal SSL Task)")  # Print a run header for clarity in logs
+print("=" * 60)  # Print a separator line for readable console output
+
+class Config:  # Define a configuration class to centralize all hyperparameters and paths
+    DATA_ROOT = "/content/SWL-LSE"  # Set the dataset root directory (Colab path)
+    IMG_SIZE = 160  # Define the spatial resolution (frames resized to 160x160)
+    NUM_FRAMES = 24  # Define the number of frames sampled per video
+    BATCH_SIZE = 8  # Define the training batch size
+    EPOCHS = 30  # Define the number of epochs (fixed at 30; no early stopping)
+    DROPOUT = 0.5  # Define dropout rate for regularization
+    LR = 1e-3  # Define initial learning rate
+    WEIGHT_DECAY = 1e-2  # Define weight decay for AdamW optimizer
+
+# =============================================================================
+# STEP 1: ROBUST DATASET DOWNLOAD WITH FALLBACKS
+# =============================================================================
+print("PHASE 1: Downloading and verifying dataset integrity...")  # Announce phase 1 in logs
+
+def safe_download_and_extract():  # Define a function that downloads and extracts dataset artifacts if missing
+    """
+    Downloads the dataset artifacts if missing.
+    - VIDEOS_REF.zip: reference videos
+    - videos_ref_annotations.csv: filename -> gloss label (not used for SSL labels, kept for metadata)
+    - ANNOTATIONS.zip: official split CSVs (if available / present)
+    - MEDIAPIPE.zip: optional 3.5GB skeletons (may timeout; not used in this RGB pipeline)
+    """  # Provide a docstring describing what the function does
+    os.makedirs(Config.DATA_ROOT, exist_ok=True)  # Create the dataset root directory if it doesn't exist
+
+    videos_ref_zip_path = os.path.join(Config.DATA_ROOT, "VIDEOS_REF.zip")  # Build the path where the video zip will be downloaded
+    annotations_zip_path = os.path.join(Config.DATA_ROOT, "ANNOTATIONS.zip")  # Build the path where the split zip will be downloaded
+
+    csv_in_current_dir_path = "videos_ref_annotations.csv"  # Define the local filename for the annotations CSV in the current working directory
+
+    videos_ref_content_dir = os.path.join(Config.DATA_ROOT, "VIDEOS_REF")  # Build the expected directory where mp4 files should exist
+    if (not os.path.exists(videos_ref_content_dir)) or (not glob.glob(os.path.join(videos_ref_content_dir, "*.mp4"))):  # Check if the videos directory is missing or empty
+        print("Downloading and extracting VIDEOS_REF.zip")  # Log that we are downloading videos
+        os.system(  # Execute a shell command from Python
+            f'wget -q "https://zenodo.org/records/13691887/files/VIDEOS_REF.zip?download=1" '  # Download URL for the video archive
+            f'-O "{videos_ref_zip_path}"'  # Save the download to the specified zip path
+        )  # End the os.system download command
+        if os.path.exists(videos_ref_zip_path):  # Verify the zip file exists after download
+            os.system(f'unzip -q -o "{videos_ref_zip_path}" -d "{Config.DATA_ROOT}/"')  # Extract the zip contents into the dataset root
+            os.system(f'rm -f "{videos_ref_zip_path}"')  # Delete the zip file after extraction to save disk space
+
+    if not os.path.exists(csv_in_current_dir_path):  # Check if the annotation CSV is missing
+        print("Downloading videos_ref_annotations.csv")  # Log that we are downloading the CSV
+        os.system(  # Execute a shell command to download the CSV
+            f'wget -q "https://zenodo.org/records/13691887/files/videos_ref_annotations.csv?download=1" '  # Download URL for CSV
+            f'-O "{csv_in_current_dir_path}"'  # Save the download to the local CSV filename
+        )  # End the os.system CSV download command
+
+    annotations_content_dir = os.path.join(Config.DATA_ROOT, "ANNOTATIONS")  # Build the expected directory for official split CSV files
+    if (not os.path.exists(annotations_content_dir)) or (not glob.glob(os.path.join(annotations_content_dir, "*.csv"))):  # Check if ANNOTATIONS is missing or empty
+        print("Downloading and extracting ANNOTATIONS.zip")  # Log that we are downloading the split archive
+        os.system(  # Execute a shell command to download the split archive
+            f'wget -q "https://zenodo.org/records/13691887/files/ANNOTATIONS.zip?download=1" '  # Download URL for ANNOTATIONS.zip
+            f'-O "{annotations_zip_path}"'  # Save zip to the specified path
+        )  # End the os.system split zip download command
+        if os.path.exists(annotations_zip_path):  # Verify the zip file exists after download
+            os.system(f'unzip -q -o "{annotations_zip_path}" -d "{Config.DATA_ROOT}/"')  # Extract the split archive into the dataset root
+            os.system(f'rm -f "{annotations_zip_path}"')  # Remove the zip file after extraction
+
+    print("Optional: MEDIAPIPE not downloaded by default (large).")  # Log that MEDIAPIPE is optional and not auto-downloaded
+    print("If you need it, download manually or increase timeout and disk.")  # Provide guidance about MEDIAPIPE download constraints
+
+safe_download_and_extract()  # Call the download function so the dataset artifacts exist
+
+# =============================================================================
+# STEP 2: LOAD ANNOTATIONS (OPTIONAL METADATA) AND CREATE LOOKUP KEYS
+# =============================================================================
+print("PHASE 2: Loading ground truth sign annotations (optional metadata)...")  # Announce phase 2 in logs
+
+annotations_df = None  # Initialize the annotations dataframe variable to None in case CSV does not exist
+fname_to_gloss = {}  # Initialize a dictionary for mapping normalized video id -> gloss label
+all_glosses_sorted = []  # Initialize a list of all unique gloss labels (sorted) for metadata purposes
+
+if os.path.exists("videos_ref_annotations.csv"):  # Check whether the annotations CSV exists locally
+    annotations_df = pd.read_csv("videos_ref_annotations.csv")  # Read the CSV into a pandas dataframe
+    if "FILENAME" in annotations_df.columns and "LABEL" in annotations_df.columns:  # Ensure expected columns exist before using them
+        annotations_df["FILENAME"] = annotations_df["FILENAME"].astype(str).str.strip()  # Normalize filename strings and remove whitespace
+        annotations_df["LABEL"] = annotations_df["LABEL"].astype(str).str.strip()  # Normalize label strings and remove whitespace
+        print("Annotated rows:", len(annotations_df))  # Print the number of annotated rows
+        print("Unique gloss labels:", annotations_df["LABEL"].nunique())  # Print how many unique gloss labels exist
+        print("Sample annotations:")  # Print a label for the sample preview
+        print(annotations_df[["FILENAME", "LABEL"]].head())  # Show the first few rows of filename/label pairs
+
+def normalize_key(name):  # Define a helper function that turns any filename-like string into a canonical key
+    """
+    Normalizes any filename-like token into a consistent key for lookups.
+    Examples:
+      'recABC' -> 'recABC'
+      'recABC.mp4' -> 'recABC'
+      '/path/to/recABC.mp4' -> 'recABC'
+    """  # Provide docstring describing the normalization logic
+    name = str(name).strip().replace("\\", "/")  # Convert to string, trim whitespace, and normalize Windows slashes
+    name = os.path.basename(name)  # Strip off directory components to keep only the filename
+    name = os.path.splitext(name)[0]  # Remove file extension to get base id (e.g., recXYZ)
+    return name  # Return the normalized base id
+
+if annotations_df is not None and ("FILENAME" in annotations_df.columns) and ("LABEL" in annotations_df.columns):  # Ensure dataframe exists and contains expected columns
+    fname_to_gloss = {  # Build mapping from normalized filename key -> label
+        normalize_key(f): g for f, g in zip(annotations_df["FILENAME"].tolist(), annotations_df["LABEL"].tolist())  # Pair each filename with its label
+    }  # End mapping creation
+    all_glosses_sorted = sorted(annotations_df["LABEL"].unique().tolist())  # Create a sorted list of unique gloss labels
+    print("Gloss mapping size:", len(fname_to_gloss))  # Print how many items are in the mapping
+    print("Vocabulary size:", len(all_glosses_sorted))  # Print how many unique glosses exist
+
+# =============================================================================
+# STEP 3: DATASET DISCOVERY
+# =============================================================================
+def discover_rgb_videos(data_root):  # Define a function to find RGB mp4 videos in VIDEOS_REF
+    """
+    Discover RGB videos under VIDEOS_REF.
+    Returns a sorted list of absolute paths.
+    """  # Provide docstring for the discovery function
+    videos_path = os.path.join(data_root, "VIDEOS_REF")  # Build the expected directory path for videos
+    rgb_videos = sorted(glob.glob(os.path.join(videos_path, "*.mp4")))  # Find all mp4 files and sort deterministically
+    if not rgb_videos:  # If no videos were found, raise an error to stop execution
+        raise RuntimeError(f"No .mp4 videos found in {videos_path}")  # Raise an informative error
+    print("RGB videos found:", len(rgb_videos))  # Print the number of videos discovered
+    print("First 5 video basenames:", [os.path.basename(p) for p in rgb_videos[:5]])  # Print the first few filenames for debugging alignment
+    return rgb_videos  # Return the list of discovered video paths
+
+rgb_paths = discover_rgb_videos(Config.DATA_ROOT)  # Discover videos and store their paths
+
+basename_to_path = {normalize_key(p): p for p in rgb_paths}  # Create lookup dict mapping normalized id -> full mp4 path
+
+# =============================================================================
+# STEP 4: OFFICIAL SPLIT LOADING WITH ROBUST FALLBACKS
+# =============================================================================
+print("PHASE 3: Loading or creating dataset splits...")  # Announce phase 3 in logs
+
+def find_filename_column(df):  # Define a helper that guesses which column stores filenames in a split CSV
+    """
+    Official split CSVs sometimes use different column names.
+    This function tries common candidates and returns the first match.
+    """  # Provide docstring
+    candidates = ["FILENAME", "filename", "file", "video", "VIDEO", "name", "NOMBRE"]  # List common candidate column names
+    for c in candidates:  # Iterate over candidates in order
+        if c in df.columns:  # If the candidate exists in the dataframe columns
+            return c  # Return the first column that matches
+    return None  # If no match is found, return None
+
+def load_splits_robust(data_root, rgb_paths):  # Define a function that loads official splits or creates fallback random splits
+    """
+    Loads official splits if present (CSV files inside ANNOTATIONS/).
+    If splits are missing or unreadable, creates a reproducible random 80/10/10 split.
+    Split dataframes will be returned with a unified column named 'FILENAME'.
+    """  # Provide docstring
+    ann_dir = os.path.join(data_root, "ANNOTATIONS")  # Build path to ANNOTATIONS directory
+    csv_files = sorted(glob.glob(os.path.join(ann_dir, "*.csv")))  # Find all CSV files in ANNOTATIONS and sort
+
+    use_official = False  # Flag indicating whether we successfully loaded official splits
+    tr_df = va_df = te_df = None  # Initialize split dataframes
+
+    if len(csv_files) >= 3:  # Only attempt official splits if at least 3 CSV files exist
+        try:  # Start a try block to safely parse official split files
+            tr_df0 = pd.read_csv(csv_files[0])  # Read the first CSV as train split candidate
+            va_df0 = pd.read_csv(csv_files[1])  # Read the second CSV as validation split candidate
+            te_df0 = pd.read_csv(csv_files[2])  # Read the third CSV as test split candidate
+            tr_col = find_filename_column(tr_df0)  # Detect filename column in train split
+            va_col = find_filename_column(va_df0)  # Detect filename column in validation split
+            te_col = find_filename_column(te_df0)  # Detect filename column in test split
+            if tr_col is None or va_col is None or te_col is None:  # If any split is missing a recognizable filename column
+                raise ValueError("Official split CSVs missing a recognizable filename column")  # Raise an error so we fallback
+            tr_df = pd.DataFrame({"FILENAME": tr_df0[tr_col].astype(str).tolist()})  # Normalize train split into a standard FILENAME column
+            va_df = pd.DataFrame({"FILENAME": va_df0[va_col].astype(str).tolist()})  # Normalize val split into a standard FILENAME column
+            te_df = pd.DataFrame({"FILENAME": te_df0[te_col].astype(str).tolist()})  # Normalize test split into a standard FILENAME column
+            use_official = True  # Mark that we will use official splits
+            print("Using official splits from ANNOTATIONS/")  # Log that official splits are active
+        except Exception as e:  # Catch any errors from loading official splits
+            print("Official splits failed, switching to random split:", e)  # Log the failure and reason
+
+    if not use_official:  # If we could not use official splits, build random deterministic splits
+        print("Using reproducible random 80/10/10 split")  # Log fallback split logic
+        indices = np.arange(len(rgb_paths))  # Create an index list over all videos
+        np.random.RandomState(SEED).shuffle(indices)  # Shuffle indices deterministically
+        split_tr = int(0.8 * len(indices))  # Compute the train cutoff index
+        split_va = int(0.9 * len(indices))  # Compute the validation cutoff index
+        tr_df = pd.DataFrame({"FILENAME": [os.path.basename(rgb_paths[i]) for i in indices[:split_tr]]})  # Create train dataframe of filenames
+        va_df = pd.DataFrame({"FILENAME": [os.path.basename(rgb_paths[i]) for i in indices[split_tr:split_va]]})  # Create validation dataframe of filenames
+        te_df = pd.DataFrame({"FILENAME": [os.path.basename(rgb_paths[i]) for i in indices[split_va:]]})  # Create test dataframe of filenames
+
+    print("Split sizes: train/val/test =", len(tr_df), len(va_df), len(te_df))  # Print the sizes of the chosen splits
+    return tr_df, va_df, te_df  # Return the three split dataframes
+
+tr_df, va_df, te_df = load_splits_robust(Config.DATA_ROOT, rgb_paths)  # Load splits or create fallback random splits
+
+# =============================================================================
+# STEP 5: VIDEO FRAME EXTRACTION (ROBUST IMPLEMENTATION) + SHUFFLE OPTION
+# =============================================================================
+def extract_video_frames(path, num_frames, img_size, shuffle=False):  # Define a frame extractor with an optional temporal shuffle
+    """
+    Extract exactly num_frames uniformly across the video.
+    If shuffle=True, the extracted indices are randomly permuted (temporal corruption).
+    Returns float32 array shaped (num_frames, img_size, img_size, 3) normalized to [0,1].
+    """  # Provide docstring for extraction behavior
+    cap = cv2.VideoCapture(str(path))  # Open the video file for reading
+    if not cap.isOpened():  # Check if the video could not be opened (missing/corrupt)
+        cap.release()  # Release the capture resource
+        return np.zeros((num_frames, img_size, img_size, 3), dtype=np.float32)  # Return a black video tensor fallback
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))  # Read total number of frames from metadata
+    total_frames = max(1, total_frames)  # Ensure total_frames is at least 1 to avoid invalid sampling
+    indices = np.linspace(0, total_frames - 1, num_frames).astype(np.int32)  # Uniformly sample frame indices
+    if shuffle:  # If temporal shuffle is requested for the pretext task
+        rng = np.random.RandomState(SEED)  # Create a deterministic RNG using the global seed
+        rng.shuffle(indices)  # Shuffle the indices in-place to destroy temporal order
+    frames = []  # Create a Python list to store extracted frames
+    for idx in indices:  # Iterate over each chosen frame index
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))  # Seek to the desired frame index
+        ret, frame = cap.read()  # Read the frame from the video
+        if ret and frame is not None:  # If the read was successful
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)  # Convert BGR (OpenCV default) to RGB
+            frame = cv2.resize(frame, (img_size, img_size), interpolation=cv2.INTER_AREA)  # Resize the frame to the model input resolution
+        else:  # If frame reading fails
+            frame = np.zeros((img_size, img_size, 3), dtype=np.uint8)  # Use a black frame fallback
+        frames.append(frame)  # Append the processed frame to the frames list
+    cap.release()  # Release the video capture resource
+    frames = np.stack(frames, axis=0)  # Convert list of frames into a numpy array of shape (T,H,W,C)
+    return frames.astype(np.float32) / 255.0  # Normalize pixel values to [0,1] float32
+
+# =============================================================================
+# STEP 6: CREATE FINAL DATASET (PATHS ONLY) + BINARY TEMPORAL PRETEXT LABELS
+# =============================================================================
+print("PHASE 4: Building dataset arrays for binary temporal task...")  # Announce phase 4 in logs
+
+def create_final_paths(split_df):  # Define a function that turns split dataframes into arrays of full video paths
+    """
+    Converts a split dataframe into:
+      - paths: array of full mp4 paths
+    This uses normalized keys so split entries can be 'recX', 'recX.mp4', or full paths.
+    """  # Provide docstring
+    paths = []  # Initialize list of resolved full paths
+    missing_video = 0  # Count how many entries could not be matched to actual mp4 files
+    if "FILENAME" not in split_df.columns:  # Ensure the split dataframe includes a filename column
+        raise ValueError("Split dataframe is missing required column: FILENAME")  # Stop if the column is missing
+    for raw in split_df["FILENAME"].values:  # Iterate over every filename in the split
+        key = normalize_key(raw)  # Normalize the entry into a canonical key
+        full_path = basename_to_path.get(key, None)  # Lookup the full video path for this key
+        if full_path is None:  # If no mp4 path exists for this key
+            missing_video += 1  # Increment missing counter
+            continue  # Skip this sample
+        paths.append(full_path)  # Append the resolved mp4 path to the output list
+    paths = np.array(paths)  # Convert Python list into a NumPy array
+    print("Rows in split:", len(split_df))  # Print total rows in the split
+    print("Matched videos:", len(paths))  # Print successfully matched videos
+    print("Unmatched videos:", missing_video)  # Print unmatched count
+    return paths  # Return the matched mp4 paths
+
+tr_paths = create_final_paths(tr_df)  # Build training video path list
+va_paths = create_final_paths(va_df)  # Build validation video path list
+te_paths = create_final_paths(te_df)  # Build test video path list
+
+if len(tr_paths) == 0:  # Check training split is non-empty
+    raise RuntimeError("Training set is empty after matching. Check filename alignment between split CSVs and mp4 basenames.")  # Fail early with explanation
+if len(va_paths) == 0:  # Check validation split is non-empty
+    raise RuntimeError("Validation set is empty after matching. Check split CSV filenames.")  # Fail early with explanation
+if len(te_paths) == 0:  # Check test split is non-empty
+    raise RuntimeError("Test set is empty after matching. Check split CSV filenames.")  # Fail early with explanation
+
+def make_binary_labels(paths):  # Define a function to double dataset and create binary labels for temporal order task
+    """
+    For each video:
+    - original order -> label 0
+    - shuffled order -> label 1
+    Dataset size doubles (2N).
+    """  # Provide docstring
+    new_paths = []  # Create an output list of paths duplicated per video
+    new_labels = []  # Create an output list of labels (0 or 1)
+    for p in paths:  # Iterate over each path
+        new_paths.append(p)  # Add original sample (same path)
+        new_labels.append(0)  # Label 0 means keep temporal order
+        new_paths.append(p)  # Add corrupted sample (same path, but loader will shuffle frames)
+        new_labels.append(1)  # Label 1 means shuffle temporal order
+    return np.array(new_paths), np.array(new_labels, dtype=np.int32)  # Return duplicated paths and int32 labels
+
+tr_paths, tr_labels = make_binary_labels(tr_paths)  # Create binary-labeled training set
+va_paths, va_labels = make_binary_labels(va_paths)  # Create binary-labeled validation set
+te_paths, te_labels = make_binary_labels(te_paths)  # Create binary-labeled test set
+
+num_classes = 2  # Set number of classes to 2 (ordered vs shuffled)
+print("Final dataset sizes (binary): train/val/test =", len(tr_paths), len(va_paths), len(te_paths))  # Print final binary dataset sizes
+print("Global num_classes (binary):", num_classes)  # Print class count for this task
+
+# =============================================================================
+# STEP 7: TENSORFLOW DATA PIPELINE (BINARY TEMPORAL PRETEXT)
+# =============================================================================
+def _py_load_video_for_task(path_tensor, label_tensor):  # Define the Python-side loader used by tf.py_function
+    """
+    Python function executed by tf.py_function.
+    If label==1, frames are temporally shuffled.
+    """  # Provide docstring
+    p = path_tensor  # Start with the path tensor input
+    if hasattr(p, "numpy"):  # If it is an eager tensor, convert to numpy
+        p = p.numpy()  # Convert to numpy
+    if isinstance(p, np.ndarray):  # If it is wrapped as a numpy array
+        p = p.item()  # Extract the scalar element
+    if isinstance(p, bytes):  # If it is bytes
+        p = p.decode("utf-8")  # Decode bytes to string
+    p = str(p)  # Ensure path is a Python string
+    y = label_tensor  # Start with the label tensor input
+    if hasattr(y, "numpy"):  # If it is an eager tensor
+        y = y.numpy()  # Convert to numpy
+    if isinstance(y, np.ndarray):  # If it is wrapped as a numpy array
+        y = y.item()  # Extract scalar element
+    y = int(y)  # Convert label to Python integer
+    shuffle = (y == 1)  # Determine whether to shuffle frames based on label
+    return extract_video_frames(p, Config.NUM_FRAMES, Config.IMG_SIZE, shuffle=shuffle)  # Extract frames with optional temporal shuffle
+
+def load_video_tf(path, label):  # Define a TensorFlow wrapper around the Python loader
+    """
+    Converts a file path to a video tensor inside the TF pipeline.
+    Label controls whether frames are shuffled (binary temporal task).
+    Returns label as scalar int32 for sparse loss/metrics.
+    """  # Provide docstring
+    video = tf.py_function(  # Use tf.py_function so we can call Python/OpenCV code inside tf.data pipeline
+        func=_py_load_video_for_task,  # The Python function to execute
+        inp=[path, label],  # Inputs are (path, label) so label determines shuffling
+        Tout=tf.float32  # Output dtype is float32 video tensor
+    )  # End tf.py_function
+    video.set_shape([Config.NUM_FRAMES, Config.IMG_SIZE, Config.IMG_SIZE, 3])  # Set static shape so Keras knows tensor dimensions
+    return video, tf.cast(label, tf.int32)  # Return video tensor and int32 label
+
+@tf.function  # Compile augmentation to run in TensorFlow graph mode for speed
+def augment_frames(video, label):  # Define augmentation function for videos
+    """
+    Applies augmentation on video tensor.
+    Kept moderate so the temporal task remains meaningful.
+    """  # Provide docstring
+    if tf.random.uniform(()) < 0.7:  # Randomly decide whether to flip horizontally
+        video = tf.image.flip_left_right(video)  # Flip each frame horizontally
+    video = tf.image.random_brightness(video, max_delta=0.2)  # Apply random brightness jitter
+    video = tf.image.random_contrast(video, lower=0.8, upper=1.2)  # Apply random contrast jitter
+    return tf.clip_by_value(video, 0.0, 1.0), label  # Clip valid range and return unchanged label
+
+def make_video_dataset(paths, labels, training=True):  # Define function to create a tf.data pipeline
+    """
+    Builds a tf.data pipeline.
+    - Paths are tf.string tensors
+    - Labels are int32 (0 or 1)
+    - Shuffle buffer is never 0
+    """  # Provide docstring
+    paths = paths.astype(str)  # Ensure NumPy array of paths is string type
+    labels = labels.astype(np.int32)  # Ensure labels are int32 for TensorFlow
+    ds = tf.data.Dataset.from_tensor_slices((paths, labels))  # Create a dataset of (path,label) pairs
+    if training:  # If training pipeline
+        buffer_size = int(min(256, len(paths)))  # Choose a shuffle buffer capped at 256
+        buffer_size = max(1, buffer_size)  # Ensure buffer is never 0 to avoid InvalidArgumentError
+        ds = ds.shuffle(buffer_size=buffer_size, seed=SEED, reshuffle_each_iteration=True)  # Shuffle dataset order each epoch
+        ds = ds.repeat()  # Repeat indefinitely so we can define steps_per_epoch manually
+    ds = ds.map(load_video_tf, num_parallel_calls=tf.data.AUTOTUNE)  # Map each path to extracted frames in parallel
+    if training:  # If training pipeline
+        ds = ds.map(augment_frames, num_parallel_calls=tf.data.AUTOTUNE)  # Apply augmentations in parallel
+    ds = ds.batch(Config.BATCH_SIZE)  # Group examples into batches
+    ds = ds.prefetch(tf.data.AUTOTUNE)  # Prefetch batches to overlap CPU preprocessing with GPU training
+    return ds  # Return the final dataset pipeline
+
+train_ds = make_video_dataset(tr_paths, tr_labels, training=True)  # Create training tf.data pipeline
+val_ds = make_video_dataset(va_paths, va_labels, training=False)  # Create validation tf.data pipeline
+test_ds = make_video_dataset(te_paths, te_labels, training=False)  # Create test tf.data pipeline
+
+# =============================================================================
+# STEP 8: 3D CNN MODEL ARCHITECTURE (BINARY CLASSIFIER HEAD)
+# =============================================================================
+def build_video_classifier(num_classes):  # Define a function that builds the 3D CNN classifier model
+    """
+    Compact 3D CNN baseline for spatiotemporal classification.
+    For this SSL pretext, num_classes=2 (ordered vs shuffled).
+    """  # Provide docstring
+    inputs = layers.Input(shape=(Config.NUM_FRAMES, Config.IMG_SIZE, Config.IMG_SIZE, 3))  # Define model input shape (T,H,W,C)
+    x = inputs  # Start computation graph from the input tensor
+    for filters in [16, 32, 64]:  # Iterate through filter sizes for progressive feature extraction
+        x = layers.Conv3D(filters, kernel_size=3, padding="same", kernel_regularizer=keras.regularizers.l2(0.01))(x)  # 3D convolution with L2 regularization
+        x = layers.BatchNormalization()(x)  # Normalize activations for stable training
+        x = layers.ReLU()(x)  # Apply non-linearity
+        x = layers.Dropout(0.4)(x)  # Drop activations to reduce overfitting
+        x = layers.MaxPool3D(pool_size=(1, 2, 2))(x)  # Pool spatially (not temporally) to preserve time resolution
+    x = layers.GlobalAveragePooling3D()(x)  # Collapse spatiotemporal dimensions into a feature vector
+    x = layers.Dense(256, activation="relu", kernel_regularizer=keras.regularizers.l2(0.01))(x)  # Dense layer for classification features
+    x = layers.Dropout(Config.DROPOUT)(x)  # Apply configurable dropout
+    x = layers.Dense(128, activation="relu")(x)  # Add a second dense layer
+    x = layers.Dropout(0.3)(x)  # Apply additional dropout
+    outputs = layers.Dense(num_classes, activation="softmax")(x)  # Output layer with softmax over 2 classes
+    return keras.Model(inputs=inputs, outputs=outputs, name="SignaMed_TemporalBinary_3DCNN")  # Create and return the Keras model
+
+# =============================================================================
+# STEP 9: MODEL COMPILATION AND TRAINING (CLEAN OUTPUT, NO EARLY STOP, 30 EPOCHS)
+# =============================================================================
+print("PHASE 5: Building and training 3D CNN binary temporal classifier...")  # Announce training phase in logs
+
+model = build_video_classifier(num_classes)  # Build the model instance
+model.summary(line_length=120)  # Print the model architecture summary
+
+optimizer = keras.optimizers.AdamW(learning_rate=Config.LR, weight_decay=Config.WEIGHT_DECAY, clipnorm=1.0)  # Create an AdamW optimizer with weight decay and gradient clipping
+
+# IMPORTANT: keep only the metrics you want to print (train/val acc+loss only)
+model.compile(  # Compile the model with optimizer, loss, and metrics
+    optimizer=optimizer,  # Set optimizer for gradient updates
+    loss="sparse_categorical_crossentropy",  # Use sparse categorical loss because labels are integer class IDs
+    metrics=["accuracy"]  # Track only accuracy (loss is always tracked automatically)
+)  # End model.compile
+
+steps_per_epoch = max(1, int(np.ceil(len(tr_paths) / Config.BATCH_SIZE)))  # Compute steps per epoch (must be >= 1)
+val_steps = max(1, int(np.ceil(len(va_paths) / Config.BATCH_SIZE)))  # Compute validation steps (must be >= 1)
+
+class CleanEpochLogger(keras.callbacks.Callback):  # Define a callback to print a clean one-line summary per epoch
+    def on_train_begin(self, logs=None):  # Define what to do when training begins
+        print("epoch,train_acc,train_loss,val_acc,val_loss")  # Print a clean CSV header line
+    def on_epoch_end(self, epoch, logs=None):  # Define what to do at the end of each epoch
+        logs = logs or {}  # Ensure logs is a dictionary even if None
+        train_acc = logs.get("accuracy", float("nan"))  # Read training accuracy from logs
+        train_loss = logs.get("loss", float("nan"))  # Read training loss from logs
+        val_acc = logs.get("val_accuracy", float("nan"))  # Read validation accuracy from logs
+        val_loss = logs.get("val_loss", float("nan"))  # Read validation loss from logs
+        print(f"{epoch+1},{train_acc:.4f},{train_loss:.4f},{val_acc:.4f},{val_loss:.4f}")  # Print one clean line for this epoch
+
+callbacks = [  # Define callbacks (NO EarlyStopping)
+    CleanEpochLogger(),  # Print clean epoch summaries only
+    keras.callbacks.ModelCheckpoint("signamed_temporal_best.keras", monitor="val_accuracy", mode="max", save_best_only=True, verbose=0),  # Save best checkpoint silently
+    keras.callbacks.ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=4, min_lr=1e-6, verbose=0),  # Reduce LR silently
+    keras.callbacks.TerminateOnNaN()  # Terminate training if NaNs occur
+]  # End callbacks list
+
+print("Starting training...")  # Log training start
+
+history = model.fit(  # Start model training
+    train_ds,  # Training dataset pipeline
+    validation_data=val_ds,  # Validation dataset pipeline
+    epochs=Config.EPOCHS,  # Exactly 30 epochs (no early stopping)
+    steps_per_epoch=steps_per_epoch,  # Steps per epoch because dataset repeats infinitely
+    validation_steps=val_steps,  # Validation steps for finite validation evaluation
+    callbacks=callbacks,  # Attach callbacks
+    verbose=0  # Disable Keras progress bar for clean output
+)  # End model.fit
+
+# =============================================================================
+# STEP 10: FINAL EVALUATION (PRINT TEST/OVERALL ACCURACY AFTER 30 EPOCHS)
+# =============================================================================
+print("PHASE 6: Final evaluation...")  # Announce evaluation phase
+
+test_steps = max(1, int(np.ceil(len(te_paths) / Config.BATCH_SIZE)))  # Compute number of steps to evaluate on test set
+results = model.evaluate(test_ds, steps=test_steps, verbose=0, return_dict=True)  # Evaluate silently and return metrics as dict
+
+test_loss = results.get("loss", None)  # Extract test loss from results dict
+test_acc = results.get("accuracy", None)  # Extract test accuracy from results dict
+
+print(f"test_accuracy,{float(test_acc) if test_acc is not None else None}")  # Print the final test/overall accuracy cleanly
+print(f"test_loss,{float(test_loss) if test_loss is not None else None}")  # Print the final test loss cleanly
+
+# =============================================================================
+# STEP 11: MODEL EXPORT AND METADATA
+# =============================================================================
+model.save("signamed_temporal_binary_model.keras")  # Save the trained Keras model to a single .keras file
+
+metadata = {  # Create a dictionary to store metadata about the run
+    "task": "temporal_binary_order_vs_shuffled",  # Store the task name
+    "num_classes": int(num_classes),  # Store number of classes
+    "num_train": int(len(tr_paths)),  # Store number of training samples
+    "num_val": int(len(va_paths)),  # Store number of validation samples
+    "num_test": int(len(te_paths)),  # Store number of test samples
+    "test_loss": float(test_loss) if test_loss is not None else None,  # Store final test loss
+    "test_accuracy": float(test_acc) if test_acc is not None else None,  # Store final test accuracy
+    "gloss_vocab_size": int(len(all_glosses_sorted)) if all_glosses_sorted else None  # Store gloss vocab size if available
+}  # End metadata dict
+
+np.savez("signamed_temporal_binary_metadata.npz", **metadata)  # Save metadata dict to a compressed .npz file
+
+print("=" * 60)  # Print separator line
+print("PIPELINE COMPLETED")  # Print completion message
+print("=" * 60)  # Print separator line
+print("Saved model: signamed_temporal_binary_model.keras")  # Print model save path
+print("Saved metadata: signamed_temporal_binary_metadata.npz")  # Print metadata save path
